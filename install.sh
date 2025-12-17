@@ -77,13 +77,12 @@ ensure_sudo() {
   fi
   if [[ "${#SUDO[@]}" -eq 0 ]]; then
     command -v sudo >/dev/null 2>&1 || die "sudo is required to install system packages."
-    # Verify we can sudo without prompting
-    if ! sudo -n true 2>/dev/null; then
-      die "This script needs passwordless sudo (sudo -n). Configure NOPASSWD for this user or run as root."
-    fi
-    SUDO=(sudo -n)
+    # Prompt once up front so later sudo calls don't interrupt randomly
+    sudo -v || die "sudo authentication failed."
+    SUDO=(sudo)
   fi
 }
+
 
 TARGET_USER="$(id -un)"
 if [[ "$(id -u)" -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then

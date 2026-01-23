@@ -443,12 +443,8 @@ ensure_grip_grab() {
     return 0
   fi
   log "Installing grip-grab (gg) via cargo..."
-  cargo install grip-grab
-
-  # Symlink to .local/bin if installed via rustup
-  if [[ -x "$TARGET_HOME/.cargo/bin/gg" ]]; then
-    ln -sf "$TARGET_HOME/.cargo/bin/gg" "$TARGET_HOME/.local/bin/gg"
-  fi
+  # Install directly to ~/.local so binary ends up in ~/.local/bin
+  cargo install --root "$TARGET_HOME/.local" grip-grab
 }
 
 CLEANUP_DIRS=()

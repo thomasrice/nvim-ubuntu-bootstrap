@@ -18,14 +18,19 @@ usage() {
   cat <<'EOF'
 Usage: install.sh [options]
 
+Installs Neovim and dependencies locally to ~/.local (no sudo required).
+
 Options:
-  --no-packages    Skip apt package installs
-  --no-node        Skip Node.js install/upgrade (mason needs Node for some tools)
-  --no-poetry      Skip poetry install (pipx)
+  --no-node        Skip Node.js install (mason needs Node for some tools)
+  --no-poetry      Skip poetry install
   --no-nvim        Skip Neovim install/upgrade
   --no-config      Skip copying the nvim config
   --no-plugins     Skip running headless Neovim to install plugins
+  --no-tools       Skip installing ripgrep, fd, fzf
   -h, --help       Show this help
+
+Prerequisites (must be installed already):
+  curl, tar, git, python3
 
 Environment:
   NVIM_BOOTSTRAP_REPO   GitHub repo "owner/name" (default: thomasrice/nvim-ubuntu-bootstrap)
@@ -33,21 +38,21 @@ Environment:
 EOF
 }
 
-INSTALL_PACKAGES=1
 INSTALL_NODE=1
 INSTALL_POETRY=1
 INSTALL_NVIM=1
 INSTALL_CONFIG=1
+INSTALL_TOOLS=1
 RUN_PLUGIN_SYNC=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --no-packages) INSTALL_PACKAGES=0 ;;
     --no-node) INSTALL_NODE=0 ;;
     --no-poetry) INSTALL_POETRY=0 ;;
     --no-nvim) INSTALL_NVIM=0 ;;
     --no-config) INSTALL_CONFIG=0 ;;
     --no-plugins) RUN_PLUGIN_SYNC=0 ;;
+    --no-tools) INSTALL_TOOLS=0 ;;
     -h | --help)
       usage
       exit 0
@@ -69,154 +74,189 @@ else
   log "Warning: unable to detect OS (missing /etc/os-release)."
 fi
 
-SUDO=()
-
-ensure_sudo() {
-  if [[ "$(id -u)" -eq 0 ]]; then
-    return 0
-  fi
-  if [[ "${#SUDO[@]}" -eq 0 ]]; then
-    command -v sudo >/dev/null 2>&1 || die "sudo is required to install system packages."
-    # Prompt once up front so later sudo calls don't interrupt randomly
-    sudo -v || die "sudo authentication failed."
-    SUDO=(sudo)
-  fi
-}
-
-
 TARGET_USER="$(id -un)"
-if [[ "$(id -u)" -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
-  TARGET_USER="$SUDO_USER"
-fi
-
-TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6 || true)"
-if [[ -z "${TARGET_HOME:-}" ]]; then
-  TARGET_HOME="$HOME"
-fi
-
-run_as_target() {
-  if [[ "$(id -u)" -eq 0 && "$TARGET_USER" != "root" ]]; then
-    sudo -u "$TARGET_USER" -H "$@"
-  else
-    "$@"
-  fi
-}
+TARGET_HOME="$HOME"
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
 }
 
-target_has_cmd() {
-  local cmd="$1"
-  if [[ "$(id -u)" -eq 0 && "$TARGET_USER" != "root" ]]; then
-    local quoted
-    quoted="$(printf '%q' "$cmd")"
-    sudo -u "$TARGET_USER" -H bash -lc "command -v $quoted >/dev/null 2>&1"
-  else
-    command -v "$cmd" >/dev/null 2>&1
-  fi
+has_cmd() {
+  command -v "$1" >/dev/null 2>&1
 }
 
-ensure_base_packages() {
-  [[ "$INSTALL_PACKAGES" -eq 1 ]] || return 0
-
-  ensure_sudo
-  log "Installing Ubuntu packages (apt)…"
-  "${SUDO[@]}" apt-get update
-  DEBIAN_FRONTEND=noninteractive "${SUDO[@]}" apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    git \
-    gnupg \
-    gzip \
-    tar \
-    unzip \
-    ripgrep \
-    fd-find \
-    fzf \
-    build-essential \
-    python3 \
-    python3-venv \
-    python3-pip \
-    cargo \
-    rustc
-
-  local optional_pkgs=(
-    pipx
-    python3-pynvim
-  )
-  for pkg in "${optional_pkgs[@]}"; do
-    if ! DEBIAN_FRONTEND=noninteractive "${SUDO[@]}" apt-get install -y --no-install-recommends "$pkg"; then
-      log "Warning: unable to install optional package '$pkg' via apt."
+check_prerequisites() {
+  log "Checking prerequisites..."
+  local missing=()
+  for cmd in curl tar git python3; do
+    if ! has_cmd "$cmd"; then
+      missing+=("$cmd")
     fi
   done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    die "Missing prerequisites: ${missing[*]}. Please install them first."
+  fi
 }
 
-ensure_fd() {
-  if target_has_cmd fd; then
-    return 0
+get_arch() {
+  local arch
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64) echo "x86_64" ;;
+    aarch64 | arm64) echo "aarch64" ;;
+    *) die "Unsupported architecture: $arch" ;;
+  esac
+}
+
+ensure_local_bin() {
+  mkdir -p "$TARGET_HOME/.local/bin"
+  if [[ ":$PATH:" != *":$TARGET_HOME/.local/bin:"* ]]; then
+    export PATH="$TARGET_HOME/.local/bin:$PATH"
   fi
-  if command -v fdfind >/dev/null 2>&1; then
-    run_as_target mkdir -p "$TARGET_HOME/.local/bin"
-    run_as_target ln -sf "$(command -v fdfind)" "$TARGET_HOME/.local/bin/fd"
-    return 0
-  fi
-  log "Warning: fd not found (install fd-find or provide fd)."
+}
+
+install_ripgrep() {
+  [[ "$INSTALL_TOOLS" -eq 1 ]] || return 0
+  if has_cmd rg; then return 0; fi
+
+  log "Installing ripgrep..."
+  local arch
+  arch="$(get_arch)"
+  local version="14.1.1"
+  local asset="ripgrep-${version}-${arch}-unknown-linux-musl.tar.gz"
+  local url="https://github.com/BurntSushi/ripgrep/releases/download/${version}/${asset}"
+
+  local tmp
+  tmp="$(mktemp -d)"
+  CLEANUP_DIRS+=("$tmp")
+
+  curl -fsSL "$url" -o "$tmp/rg.tar.gz"
+  tar -xzf "$tmp/rg.tar.gz" -C "$tmp"
+  cp "$tmp/ripgrep-${version}-${arch}-unknown-linux-musl/rg" "$TARGET_HOME/.local/bin/rg"
+  chmod +x "$TARGET_HOME/.local/bin/rg"
+}
+
+install_fd() {
+  [[ "$INSTALL_TOOLS" -eq 1 ]] || return 0
+  if has_cmd fd; then return 0; fi
+
+  log "Installing fd..."
+  local arch
+  arch="$(get_arch)"
+  local version="10.2.0"
+  local asset="fd-v${version}-${arch}-unknown-linux-musl.tar.gz"
+  local url="https://github.com/sharkdp/fd/releases/download/v${version}/${asset}"
+
+  local tmp
+  tmp="$(mktemp -d)"
+  CLEANUP_DIRS+=("$tmp")
+
+  curl -fsSL "$url" -o "$tmp/fd.tar.gz"
+  tar -xzf "$tmp/fd.tar.gz" -C "$tmp"
+  cp "$tmp/fd-v${version}-${arch}-unknown-linux-musl/fd" "$TARGET_HOME/.local/bin/fd"
+  chmod +x "$TARGET_HOME/.local/bin/fd"
+}
+
+install_fzf() {
+  [[ "$INSTALL_TOOLS" -eq 1 ]] || return 0
+  if has_cmd fzf; then return 0; fi
+
+  log "Installing fzf..."
+  local arch
+  arch="$(get_arch)"
+  local version="0.56.3"
+  local arch_name
+  case "$arch" in
+    x86_64) arch_name="amd64" ;;
+    aarch64) arch_name="arm64" ;;
+  esac
+  local asset="fzf-${version}-linux_${arch_name}.tar.gz"
+  local url="https://github.com/junegunn/fzf/releases/download/v${version}/${asset}"
+
+  local tmp
+  tmp="$(mktemp -d)"
+  CLEANUP_DIRS+=("$tmp")
+
+  curl -fsSL "$url" -o "$tmp/fzf.tar.gz"
+  tar -xzf "$tmp/fzf.tar.gz" -C "$tmp"
+  cp "$tmp/fzf" "$TARGET_HOME/.local/bin/fzf"
+  chmod +x "$TARGET_HOME/.local/bin/fzf"
 }
 
 ensure_node() {
   [[ "$INSTALL_NODE" -eq 1 ]] || return 0
 
-  local major=""
-  if command -v node >/dev/null 2>&1; then
-    major="$(node -v | sed -E 's/^v([0-9]+).*/\\1/')"
+  # Check if node >= 18 already exists
+  if has_cmd node; then
+    local major
+    major="$(node -v | sed -E 's/^v([0-9]+).*/\1/')"
     if [[ "$major" =~ ^[0-9]+$ ]] && [[ "$major" -ge 18 ]]; then
       return 0
     fi
   fi
 
-  ensure_sudo
+  log "Installing Node.js via fnm..."
+  local arch
+  arch="$(get_arch)"
+  local arch_name
+  case "$arch" in
+    x86_64) arch_name="linux" ;;
+    aarch64) arch_name="linux-arm64" ;;
+  esac
 
-  log "Installing Node.js (via NodeSource)…"
-  DEBIAN_FRONTEND=noninteractive "${SUDO[@]}" apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    gnupg
-  need_cmd curl
-  curl -fsSL https://deb.nodesource.com/setup_20.x | "${SUDO[@]}" -E bash -
-  DEBIAN_FRONTEND=noninteractive "${SUDO[@]}" apt-get install -y --no-install-recommends nodejs
+  # Install fnm if not present
+  if ! has_cmd fnm; then
+    local fnm_url="https://fnm.vercel.app/install"
+    curl -fsSL "$fnm_url" | bash -s -- --install-dir "$TARGET_HOME/.local/bin" --skip-shell
+  fi
+
+  # Set up fnm environment
+  export FNM_DIR="$TARGET_HOME/.local/share/fnm"
+  eval "$("$TARGET_HOME/.local/bin/fnm" env)"
+
+  # Install Node.js 20
+  "$TARGET_HOME/.local/bin/fnm" install 20
+  "$TARGET_HOME/.local/bin/fnm" default 20
+
+  # Create symlinks in .local/bin for node/npm
+  local node_path
+  node_path="$("$TARGET_HOME/.local/bin/fnm" exec --using=20 which node)"
+  local npm_path
+  npm_path="$("$TARGET_HOME/.local/bin/fnm" exec --using=20 which npm)"
+  ln -sf "$node_path" "$TARGET_HOME/.local/bin/node"
+  ln -sf "$npm_path" "$TARGET_HOME/.local/bin/npm"
 }
 
 ensure_poetry() {
   [[ "$INSTALL_POETRY" -eq 1 ]] || return 0
 
-  if target_has_cmd poetry; then
+  if has_cmd poetry; then
     return 0
   fi
 
-  if command -v pipx >/dev/null 2>&1; then
-    log "Installing poetry (pipx)…"
-    run_as_target pipx install poetry
+  if has_cmd pipx; then
+    log "Installing poetry via pipx..."
+    pipx install poetry
     return 0
   fi
 
-  log "Installing poetry (official installer)…"
+  log "Installing poetry via official installer..."
   need_cmd curl
   need_cmd python3
 
   local tmp
-  tmp="$(run_as_target mktemp -d)"
+  tmp="$(mktemp -d)"
   CLEANUP_DIRS+=("$tmp")
-  run_as_target curl -fsSL https://install.python-poetry.org -o "$tmp/install-poetry.py"
-  run_as_target python3 "$tmp/install-poetry.py" -y
+  curl -fsSL https://install.python-poetry.org -o "$tmp/install-poetry.py"
+  python3 "$tmp/install-poetry.py" -y
 }
 
 install_neovim() {
   [[ "$INSTALL_NVIM" -eq 1 ]] || return 0
 
-  if target_has_cmd nvim; then
+  if has_cmd nvim; then
     local current_line major minor
-    current_line="$(run_as_target nvim --version | head -n1 || true)"
+    current_line="$(nvim --version | head -n1 || true)"
     if [[ "$current_line" =~ ^NVIM\ v([0-9]+)\.([0-9]+) ]]; then
       major="${BASH_REMATCH[1]}"
       minor="${BASH_REMATCH[2]}"
@@ -243,22 +283,22 @@ install_neovim() {
   esac
 
   local tmp
-  tmp="$(run_as_target mktemp -d)"
+  tmp="$(mktemp -d)"
   CLEANUP_DIRS+=("$tmp")
   local url="https://github.com/neovim/neovim/releases/latest/download/$asset"
-  log "Installing Neovim from $url…"
-  run_as_target curl -fsSL "$url" -o "$tmp/nvim.tar.gz"
-  run_as_target tar -xzf "$tmp/nvim.tar.gz" -C "$tmp"
+  log "Installing Neovim from $url..."
+  curl -fsSL "$url" -o "$tmp/nvim.tar.gz"
+  tar -xzf "$tmp/nvim.tar.gz" -C "$tmp"
 
   local extracted
   extracted="$(find "$tmp" -maxdepth 1 -mindepth 1 -type d -name 'nvim-linux-*' | head -n1 || true)"
   [[ -n "$extracted" && -d "$extracted" ]] || die "Failed to unpack Neovim archive."
 
   local prefix="$TARGET_HOME/.local/opt/nvim"
-  run_as_target mkdir -p "$TARGET_HOME/.local/opt" "$TARGET_HOME/.local/bin"
-  run_as_target rm -rf "$prefix"
-  run_as_target mv "$extracted" "$prefix"
-  run_as_target ln -sf "$prefix/bin/nvim" "$TARGET_HOME/.local/bin/nvim"
+  mkdir -p "$TARGET_HOME/.local/opt" "$TARGET_HOME/.local/bin"
+  rm -rf "$prefix"
+  mv "$extracted" "$prefix"
+  ln -sf "$prefix/bin/nvim" "$TARGET_HOME/.local/bin/nvim"
 }
 
 resolve_bootstrap_root() {
@@ -279,13 +319,13 @@ resolve_bootstrap_root() {
   need_cmd tar
 
   local tmp
-  tmp="$(run_as_target mktemp -d)"
+  tmp="$(mktemp -d)"
   CLEANUP_DIRS+=("$tmp")
 
   local url="https://github.com/${repo}/archive/refs/heads/${ref}.tar.gz"
-  log "Fetching config from $repo@$ref…"
-  run_as_target curl -fsSL "$url" -o "$tmp/repo.tar.gz"
-  run_as_target tar -xzf "$tmp/repo.tar.gz" -C "$tmp"
+  log "Fetching config from $repo@$ref..."
+  curl -fsSL "$url" -o "$tmp/repo.tar.gz"
+  tar -xzf "$tmp/repo.tar.gz" -C "$tmp"
 
   local extracted
   extracted="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)"
@@ -303,16 +343,16 @@ install_config() {
 
   [[ -d "$src" ]] || die "Config source missing: $src"
 
-  run_as_target mkdir -p "$TARGET_HOME/.config"
+  mkdir -p "$TARGET_HOME/.config"
 
   if [[ -e "$dest" ]]; then
     local backup="${dest}.backup-$(date +%Y%m%d%H%M%S)"
     log "Backing up existing nvim config to $backup"
-    run_as_target mv "$dest" "$backup"
+    mv "$dest" "$backup"
   fi
 
   log "Installing Neovim config to $dest"
-  run_as_target cp -a "$src" "$dest"
+  cp -a "$src" "$dest"
 }
 
 sync_plugins() {
@@ -320,39 +360,37 @@ sync_plugins() {
 
   local nvim_bin="$TARGET_HOME/.local/bin/nvim"
   if [[ ! -x "$nvim_bin" ]]; then
-    if target_has_cmd nvim; then nvim_bin="nvim"; else
+    if has_cmd nvim; then nvim_bin="nvim"; else
       log "Warning: nvim not found; skipping plugin sync."
       return 0
     fi
   fi
 
-  log "Installing/updating plugins (headless)…"
-  run_as_target "$nvim_bin" --headless "+Lazy! sync" "+qa"
+  log "Installing/updating plugins (headless)..."
+  "$nvim_bin" --headless "+Lazy! sync" "+qa"
 
-  log "Waiting for Mason installs to finish (headless)…"
+  log "Waiting for Mason installs to finish (headless)..."
   local tmp lua_file
-  tmp="$(run_as_target mktemp -d)"
+  tmp="$(mktemp -d)"
   CLEANUP_DIRS+=("$tmp")
   lua_file="$tmp/wait_mason.lua"
 
-  # Write Lua script to file (no shell expansion)
   cat >"$lua_file" <<'LUA'
 local ok, registry = pcall(require, "mason-registry")
 if not ok then
-  -- Mason not installed/loaded; nothing to wait for
   vim.cmd("qa")
   return
 end
 
 local function any_installing()
-  registry.refresh() -- best-effort
+  registry.refresh()
   for _, pkg in ipairs(registry.get_installed_packages()) do
     if pkg:is_installing() then return true end
   end
   return false
 end
 
-local timeout = 300 -- seconds
+local timeout = 300
 local start = vim.loop.now()
 
 local function elapsed()
@@ -375,33 +413,37 @@ end
 tick()
 LUA
 
-  run_as_target "$nvim_bin" --headless -c "luafile $lua_file"
+  "$nvim_bin" --headless -c "luafile $lua_file"
 }
 
 ensure_rustup() {
-  if target_has_cmd cargo && target_has_cmd rustc; then
-    local v
-    v="$(run_as_target cargo --version | awk '{print $2}')"
-    # If cargo is old, we’ll still install rustup below; easiest is just proceed if rustup exists
-    if target_has_cmd rustup; then return 0; fi
+  if has_cmd cargo && has_cmd rustc; then
+    if has_cmd rustup; then return 0; fi
   fi
 
-  log "Installing Rust toolchain (rustup)…"
+  log "Installing Rust toolchain via rustup..."
   need_cmd curl
-  run_as_target bash -lc 'curl -fsSL https://sh.rustup.rs | sh -s -- -y'
-  # Make sure rustup env is available for non-interactive shells
-  run_as_target bash -lc 'mkdir -p "$HOME/.local/bin"; ln -sf "$HOME/.cargo/bin/cargo" "$HOME/.local/bin/cargo"; ln -sf "$HOME/.cargo/bin/rustc" "$HOME/.local/bin/rustc"'
-  # Ensure stable is installed/selected
-  run_as_target bash -lc '"$HOME/.cargo/bin/rustup" default stable'
+  curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path
+
+  # Symlink cargo/rustc to .local/bin
+  mkdir -p "$TARGET_HOME/.local/bin"
+  ln -sf "$TARGET_HOME/.cargo/bin/cargo" "$TARGET_HOME/.local/bin/cargo"
+  ln -sf "$TARGET_HOME/.cargo/bin/rustc" "$TARGET_HOME/.local/bin/rustc"
+  ln -sf "$TARGET_HOME/.cargo/bin/rustup" "$TARGET_HOME/.local/bin/rustup"
+
+  # Ensure stable is installed
+  "$TARGET_HOME/.cargo/bin/rustup" default stable
 }
 
 ensure_grip_grab() {
-  if target_has_cmd gg; then return 0; fi
-  if ! target_has_cmd cargo; then log "Warning: cargo not found; cannot install grip-grab/gg."; return 0; fi
-  log "Installing grip-grab (gg) via cargo…"
-  run_as_target bash -lc '"$HOME/.cargo/bin/cargo" install grip-grab'
-  # Ensure gg is discoverable in subsequent commands
-  run_as_target bash -lc 'mkdir -p "$HOME/.local/bin"; ln -sf "$HOME/.cargo/bin/gg" "$HOME/.local/bin/gg"'
+  if has_cmd gg; then return 0; fi
+  if ! has_cmd cargo; then
+    log "Warning: cargo not found; cannot install grip-grab/gg."
+    return 0
+  fi
+  log "Installing grip-grab (gg) via cargo..."
+  "$TARGET_HOME/.cargo/bin/cargo" install grip-grab
+  ln -sf "$TARGET_HOME/.cargo/bin/gg" "$TARGET_HOME/.local/bin/gg"
 }
 
 CLEANUP_DIRS=()
@@ -412,10 +454,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-ensure_base_packages
+# Main installation sequence
+check_prerequisites
+ensure_local_bin
+
+install_ripgrep
+install_fd
+install_fzf
 ensure_node
 ensure_poetry
-ensure_fd
 install_neovim
 
 BOOTSTRAP_ROOT="$(resolve_bootstrap_root)"
@@ -425,3 +472,6 @@ ensure_grip_grab
 sync_plugins
 
 log "Done."
+log ""
+log "Make sure ~/.local/bin is in your PATH. Add this to your ~/.bashrc or ~/.zshrc:"
+log '  export PATH="$HOME/.local/bin:$PATH"'

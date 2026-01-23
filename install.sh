@@ -417,8 +417,9 @@ LUA
 }
 
 ensure_rustup() {
-  if has_cmd cargo && has_cmd rustc; then
-    if has_cmd rustup; then return 0; fi
+  # If cargo already exists (apt, homebrew, etc.), use it
+  if has_cmd cargo; then
+    return 0
   fi
 
   log "Installing Rust toolchain via rustup..."
@@ -442,8 +443,12 @@ ensure_grip_grab() {
     return 0
   fi
   log "Installing grip-grab (gg) via cargo..."
-  "$TARGET_HOME/.cargo/bin/cargo" install grip-grab
-  ln -sf "$TARGET_HOME/.cargo/bin/gg" "$TARGET_HOME/.local/bin/gg"
+  cargo install grip-grab
+
+  # Symlink to .local/bin if installed via rustup
+  if [[ -x "$TARGET_HOME/.cargo/bin/gg" ]]; then
+    ln -sf "$TARGET_HOME/.cargo/bin/gg" "$TARGET_HOME/.local/bin/gg"
+  fi
 }
 
 CLEANUP_DIRS=()
